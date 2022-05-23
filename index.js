@@ -1,12 +1,13 @@
 const express = require("express");
 const app = express();
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const port = process.env.PORT || 5000;
+require("dotenv").config();
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const { request } = require("express");
 const { query } = require("express");
-require("dotenv").config();
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
 //midleware
 app.use(cors());
@@ -20,6 +21,7 @@ const client = new MongoClient(uri, {
   serverApi: ServerApiVersion.v1,
 });
 
+//verify jwt
 function verifyJWT(req, res, next) {
   // console.log("abc");
   const authHeader = req.headers.authorization;
@@ -44,17 +46,51 @@ async function run() {
     const serviceCollection = client
       .db("doctors_portal")
       .collection("services");
+
     const bookingCollection = client
       .db("doctors_portal")
       .collection("bookings");
+
     const userCollection = client.db("doctors_portal").collection("users");
+
+    const doctorCollection = client.db("doctors_portal").collection("doctors");
+
+    const paymentCollection = client
+      .db("doctors_portal")
+      .collection("payments");
+
+    //verify Admin
+    const verifyAdmin = async (req, res, next) => {
+      const requester = req.decoded.email;
+      const requesterAccount = await userCollection.findOne({
+        email: requester,
+      });
+      if (requesterAccount.role === "admin") {
+        next();
+      } else {
+        res.status(403).send({ message: "forbidden" });
+      }
+    };
 
     //get all services
     app.get("/services", async (req, res) => {
       const query = {};
-      const cursor = serviceCollection.find(query);
+      const cursor = serviceCollection.find(query).project({ name: 1 });
       const services = await cursor.toArray();
       res.send(services);
+    });
+
+    //payment Api
+    app.post("/create-payment-intent", verifyJWT, async (req, res) => {
+      const service = req.body;
+      const price = service.price;
+      const amount = price * 100;
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
+      res.send({ clientSecret: paymentIntent.client_secret });
     });
 
     //All users
@@ -64,22 +100,14 @@ async function run() {
     });
 
     //Make Admin
-    app.put("/user/admin/:email", verifyJWT, async (req, res) => {
+    app.put("/user/admin/:email", verifyJWT, verifyAdmin, async (req, res) => {
       const email = req.params.email;
-      const requester = req.decoded.email;
-      const requesterAccount = await userCollection.findOne({
-        email: requester,
-      });
-      if (requesterAccount.role === "admin") {
-        const filter = { email: email };
-        const updateDoc = {
-          $set: { role: "admin" },
-        };
-        const result = await userCollection.updateOne(filter, updateDoc);
-        res.send(result);
-      } else {
-        res.status(403).send({ message: "forbidden" });
-      }
+      const filter = { email: email };
+      const updateDoc = {
+        $set: { role: "admin" },
+      };
+      const result = await userCollection.updateOne(filter, updateDoc);
+      res.send(result);
     });
 
     //Admin protecting rout
@@ -132,6 +160,54 @@ async function run() {
       } else {
         return res.status(403).send({ message: "Forbidden Access" });
       }
+    });
+
+    //get booking by booking id
+    app.get("/booking/:id", verifyJWT, async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: ObjectId(id) };
+      const booking = await bookingCollection.findOne(query);
+      res.send(booking);
+    });
+
+    //payment collection
+    app.patch("/booking/:id", verifyJWT, async (req, res) => {
+      const id = req.params.id;
+      const payment = req.body;
+      const filter = { _id: ObjectId(id) };
+      const updatedDoc = {
+        $set: {
+          paid: true,
+          transactionId: payment.transactionId,
+        },
+      };
+      const result = await paymentCollection.insertOne(payment);
+      const updatedBooking = await bookingCollection.updateOne(
+        filter,
+        updatedDoc
+      );
+      res.send(updatedDoc);
+    });
+
+    //add doctors collection
+    app.post("/doctor", verifyJWT, verifyAdmin, async (req, res) => {
+      const doctor = req.body;
+      const result = await doctorCollection.insertOne(doctor);
+      res.send(result);
+    });
+
+    //get doctors properties
+    app.get("/doctor", verifyJWT, verifyAdmin, async (req, res) => {
+      const doctors = await doctorCollection.find().toArray();
+      res.send(doctors);
+    });
+
+    //delete doctor
+    app.delete("/doctor/:email", verifyJWT, verifyAdmin, async (req, res) => {
+      const email = req.params.email;
+      const filter = { email: email };
+      const result = await doctorCollection.deleteOne(filter);
+      res.send(result);
     });
 
     //filter the booking, and display the rest
